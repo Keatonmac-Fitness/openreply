@@ -72,11 +72,31 @@ const NON_TEMPLATE_REJECTIONS = [
   /requested user cannot be found/i,
 ];
 
+// Meta's generic "An unknown error has occurred" (code 1) and "An unexpected
+// error has occurred. Please retry your request later" (code 2) do not mean the
+// send was refused. In production Meta returned these while still delivering
+// the message (the echo webhook arrived), so treating them as failures made the
+// worker fall back to text, retry, and let the sweep re-enqueue — one commenter
+// received 15+ copies. A send that ends in one of these is delivery-uncertain:
+// never resend it.
+const AMBIGUOUS_META_ERROR_CODES = new Set([1, 2]);
+
+function isDeliveryUncertain(error: unknown): error is Error {
+  if (error instanceof ZernioDeliveryUnconfirmedError) return true;
+  return (
+    error instanceof MetaApiError &&
+    AMBIGUOUS_META_ERROR_CODES.has(error.code)
+  );
+}
+
 function isTemplateRejection(error: unknown): boolean {
   if (
     error instanceof TokenExpiredError ||
     error instanceof RateLimitError ||
-    error instanceof ZernioApiError
+    error instanceof ZernioApiError ||
+    // The button message may already have landed; a text fallback would be a
+    // second DM.
+    isDeliveryUncertain(error)
   ) {
     return false;
   }
@@ -439,7 +459,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
                 commentId,
               },
             },
-            data: { publicReplyError: formatError(error), publicReplyDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError },
+            data: { publicReplyError: formatError(error), publicReplyDeliveryUnconfirmed: isDeliveryUncertain(error) },
           })
           .catch(() => {});
       }
@@ -736,7 +756,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUncertain(error),
         },
       });
       throw error;
@@ -1014,7 +1034,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     // failure the user can act on — so don't log it as FAILED and don't retry
     // it against a window that cannot reopen on its own. It still delivers in
     // the case that does work: the user replied by typing instead of tapping.
-    if (fallback && !(error instanceof ZernioDeliveryUnconfirmedError)) {
+    if (fallback && !isDeliveryUncertain(error)) {
       console.log(
         "[DM Worker] Read fallback not delivered (messaging window closed):",
         formatError(error),
@@ -1039,12 +1059,12 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         commentId: dedupeId,
         status: "FAILED",
         errorMessage: formatError(error),
-        dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+        dmDeliveryUnconfirmed: isDeliveryUncertain(error),
       },
       update: {
         status: "FAILED",
         errorMessage: formatError(error),
-        dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+        dmDeliveryUnconfirmed: isDeliveryUncertain(error),
       },
     });
     throw error;
@@ -1353,13 +1373,13 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUncertain(error),
         },
         update: {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUncertain(error),
         },
       });
       throw error;
@@ -1384,7 +1404,7 @@ async function processJob(job: Job<DmQueueJob>): Promise<void> {
   try {
     await dispatchJob(job);
   } catch (error) {
-    if (error instanceof ZernioDeliveryUnconfirmedError)
+    if (isDeliveryUncertain(error))
       throw new UnrecoverableError(error.message);
     throw error;
   }

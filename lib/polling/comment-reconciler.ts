@@ -47,6 +47,9 @@ const LOOKBACK_HOURS = Number(process.env.COMMENT_POLL_LOOKBACK_HOURS ?? 72);
 const MAX_NEW_PER_SWEEP = Number(process.env.COMMENT_POLL_MAX_PER_SWEEP ?? 30);
 // For "any post" campaigns, how many recent posts to scan.
 const RECENT_MEDIA_LIMIT = 10;
+// Matches the queue's default `attempts` (lib/queue/client.ts). A FAILED DmLog
+// at this count means a job already used every retry on the comment.
+const MAX_DM_JOB_ATTEMPTS = 3;
 
 interface SweepStat {
   campaign: string;
@@ -188,6 +191,8 @@ async function sweepCampaign({
   if (mediaIds.length === 0) return stat;
 
   const queue = getDMQueue();
+  // Read lazily: only sweeps that find a comment needing action pay for it.
+  let queuedCommentIds: Set<string> | undefined;
 
   for (const mediaId of mediaIds) {
     let comments: InstagramComment[];
@@ -248,9 +253,31 @@ async function sweepCampaign({
     });
     const handledSet = new Set(handled.map((h) => h.commentId));
 
+    // Third guard, against repeat sends: a comment whose DM job already ran out
+    // of retries is not tried again, and a comment that still has a job waiting,
+    // delayed, or running is not queued a second time. Without these, a comment
+    // Meta keeps answering with an error got a fresh job every sweep, each
+    // overlapping the last — and when those errors hid a delivered message, the
+    // commenter received a new copy every five minutes.
+    const exhausted = await prisma.dmLog.findMany({
+      where: {
+        automationId: automation.id,
+        commentId: { in: needsAction.map((c) => c.id) },
+        status: "FAILED",
+        attempts: { gte: MAX_DM_JOB_ATTEMPTS },
+      },
+      select: { commentId: true },
+    });
+    const exhaustedSet = new Set(exhausted.map((e) => e.commentId));
+    queuedCommentIds ??= await commentIdsInQueue(queue);
+    const queued = queuedCommentIds;
+
     // Oldest first, so whoever commented earliest gets answered first, capped.
     const fresh = needsAction
-      .filter((c) => !handledSet.has(c.id))
+      .filter(
+        (c) =>
+          !handledSet.has(c.id) && !exhaustedSet.has(c.id) && !queued.has(c.id)
+      )
       .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
       .slice(0, MAX_NEW_PER_SWEEP);
 
@@ -278,11 +305,38 @@ async function sweepCampaign({
             : undefined,
         source: "POLLING",
       });
+      queued.add(c.id);
       stat.enqueued += 1;
     }
   }
 
   return stat;
+}
+
+/**
+ * Comment ids that already have a comment job waiting, delayed (a retry in
+ * backoff counts), or running. Those jobs will send on their own, so the sweep
+ * must not add another for the same comment.
+ */
+export async function commentIdsInQueue(queue: {
+  getJobs: (
+    types: ("waiting" | "delayed" | "active" | "prioritized")[]
+  ) => Promise<({ data: unknown } | undefined)[]>;
+}): Promise<Set<string>> {
+  const jobs = await queue.getJobs(["waiting", "delayed", "active", "prioritized"]);
+  const ids = new Set<string>();
+  for (const job of jobs) {
+    const data = job?.data;
+    if (
+      typeof data === "object" &&
+      data !== null &&
+      "commentId" in data &&
+      typeof data.commentId === "string"
+    ) {
+      ids.add(data.commentId);
+    }
+  }
+  return ids;
 }
 
 /**

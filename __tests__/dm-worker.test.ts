@@ -137,6 +137,7 @@ vi.mock("bullmq", () => {
 });
 
 import { createDMWorker } from "../lib/queue/dm-worker";
+import { MetaApiError } from "@/lib/meta/client";
 
 const usagePeriodStart = new Date("2026-05-01T00:00:00.000Z");
 
@@ -950,6 +951,91 @@ describe("DM Worker — one private reply per comment", () => {
         data: expect.objectContaining({ status: "SENT" }),
       })
     );
+  });
+});
+
+describe("DM Worker — Meta errors that can hide a delivered DM", () => {
+  const withTrackedLink = {
+    ...mockAutomation,
+    trackedLinks: [
+      { slug: "abc123", label: null, destinationUrl: "https://example.com" },
+    ],
+  };
+
+  it("does not fall back to text or retry when the button send returns Meta code 1", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([withTrackedLink]);
+    mockSendPrivateReplyWithLinkButton.mockRejectedValue(
+      new MetaApiError(1, undefined, "trace", "An unknown error has occurred.")
+    );
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.toMatchObject({
+      name: "UnrecoverableError",
+    });
+
+    // Meta delivered the button message despite the error, so a text fallback
+    // would be a second copy.
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "FAILED",
+          dmDeliveryUnconfirmed: true,
+        }),
+      })
+    );
+  });
+
+  it("marks a plain private reply that returns Meta code 2 as unconfirmed, not retryable", async () => {
+    mockSendPrivateReply.mockRejectedValue(
+      new MetaApiError(
+        2,
+        undefined,
+        "trace",
+        "An unexpected error has occurred. Please retry your request later."
+      )
+    );
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.toMatchObject({
+      name: "UnrecoverableError",
+    });
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ dmDeliveryUnconfirmed: true }),
+      })
+    );
+  });
+
+  it("still retries a Meta error that means the send was refused", async () => {
+    mockSendPrivateReply.mockRejectedValue(
+      new MetaApiError(551, undefined, "trace", "This person isn't available")
+    );
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.toMatchObject({
+      name: "MetaApiError",
+    });
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ dmDeliveryUnconfirmed: false }),
+      })
+    );
+  });
+
+  it("never re-sends a comment whose earlier delivery is unconfirmed", async () => {
+    mockPrisma.dmLog.findUnique.mockResolvedValue({
+      id: "existing_log",
+      status: "FAILED",
+      dmDeliveryUnconfirmed: true,
+      publicReplySentAt: null,
+    });
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockSendPrivateReplyWithLinkButton).not.toHaveBeenCalled();
   });
 });
 
